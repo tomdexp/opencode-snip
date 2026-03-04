@@ -22,13 +22,7 @@ brew install edouard-claude/tap/snip
 go install github.com/edouard-claude/snip/cmd/snip@latest
 ```
 
-### 2. Install plugin via npm
-
-```bash
-npm install opencode-snip
-```
-
-### 3. Configure OpenCode
+### 2. Configure OpenCode
 
 Add the plugin to your OpenCode config (`~/.config/opencode/opencode.json`):
 
