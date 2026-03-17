@@ -3,8 +3,14 @@
   "description": "OpenCode plugin that prefixes shell commands with snip to reduce LLM token consumption",
   "type": "module",
   "main": ".opencode/plugins/index.ts",
-  "scripts": {
-    "typecheck": "tsc --noEmit"
+"scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.0.0"
@@ -40,7 +46,12 @@
     "plugins": [
       "@semantic-release/commit-analyzer",
       "@semantic-release/release-notes-generator",
-      "@semantic-release/npm",
+      [
+        "@semantic-release/npm",
+        {
+          "npmPublish": true
+        }
+      ],
       "@semantic-release/github"
     ]
   }
