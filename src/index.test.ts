@@ -132,4 +132,30 @@ describe("toolExecuteBefore", () => {
       expect(mockOutput.args.command).toBe("cd /tmp && snip ls")
     })
   })
+
+  describe("redirections with &", () => {
+    it("should not break 2>&1 redirection", async () => {
+      mockOutput.args.command = "find / -name \"*.log\" 2>&1"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1")
+    })
+
+    it("should not break 1>&2 redirection", async () => {
+      mockOutput.args.command = "cmd 1>&2"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cmd 1>&2")
+    })
+
+    it("should handle 2>&1 with pipe", async () => {
+      mockOutput.args.command = "find / -name \"*.log\" 2>&1 | grep error"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1 | snip grep error")
+    })
+
+    it("should handle 2>&1 with chained commands", async () => {
+      mockOutput.args.command = "cmd1 2>&1 && cmd2"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cmd1 2>&1 && snip cmd2")
+    })
+  })
 })
