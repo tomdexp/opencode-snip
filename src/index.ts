@@ -4,7 +4,7 @@ const ENV_VAR_RE = /^([A-Za-z_][A-Za-z0-9_]*=[^\s]* +)*/
 const UNPROXYABLE_COMMANDS = new Set([
   "cd", "source", ".", "export", "alias", "unset", "set", "shopt", "eval", "exec",
 ])
-const OPERATOR_RE = /(\s*(?:&&|\|\||[;&|])\s*)/
+const OPERATOR_RE = /(\s*(?:&&|\|\||;|\|)\s*|\s&\s?)/
 
 function snipCommand(command: string): string {
   const envPrefix = (command.match(ENV_VAR_RE) ?? [""])[0]
