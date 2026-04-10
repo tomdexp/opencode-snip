@@ -37,7 +37,7 @@ describe("toolExecuteBefore", () => {
   it("should handle command with |", async () => {
     mockOutput.args.command = "git log | head"
     await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip git log | snip head")
+    expect(mockOutput.args.command).toBe("snip git log | head")
   })
 
   it("should handle command with ;", async () => {
@@ -149,13 +149,51 @@ describe("toolExecuteBefore", () => {
     it("should handle 2>&1 with pipe", async () => {
       mockOutput.args.command = "find / -name \"*.log\" 2>&1 | grep error"
       await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1 | snip grep error")
+      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1 | grep error")
     })
 
     it("should handle 2>&1 with chained commands", async () => {
       mockOutput.args.command = "cmd1 2>&1 && cmd2"
       await toolExecuteBefore(mockInput, mockOutput)
       expect(mockOutput.args.command).toBe("snip cmd1 2>&1 && snip cmd2")
+    })
+  })
+
+  describe("pipe expressions with quotes", () => {
+    it("should not split pipes inside single quotes", async () => {
+      mockOutput.args.command = "cat file.json | jq '.content | .text'"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.content | .text'")
+    })
+
+    it("should not split pipes inside double quotes", async () => {
+      mockOutput.args.command = 'cat file.json | jq ".content | .text"'
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe('snip cat file.json | jq ".content | .text"')
+    })
+
+    it("should handle jq with fromjson", async () => {
+      mockOutput.args.command = "cat file.json | jq '.content[0].text | fromjson'"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.content[0].text | fromjson'")
+    })
+
+    it("should handle multiple pipes in jq", async () => {
+      mockOutput.args.command = "cat file.json | jq '.a | .b | .c'"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.a | .b | .c'")
+    })
+
+    it("should handle pipe with || operator", async () => {
+      mockOutput.args.command = "cmd1 || cmd2"
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip cmd1 || snip cmd2")
+    })
+
+    it("should handle mixed quotes and pipes", async () => {
+      mockOutput.args.command = 'echo "hello | world" | cat'
+      await toolExecuteBefore(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe('snip echo "hello | world" | cat')
     })
   })
 })
