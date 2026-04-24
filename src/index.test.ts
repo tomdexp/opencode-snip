@@ -1,199 +1,384 @@
-import { describe, it, expect, beforeEach } from "vitest"
-import { toolExecuteBefore } from "./index"
+import { beforeEach, describe, expect, it } from "vitest"
 
-describe("toolExecuteBefore", () => {
-  let mockInput: { tool: string; sessionID: string; callID: string }
-  let mockOutput: { args: { command: string } }
+import {
+  SnipPlugin,
+  createSnipMatcher,
+  createToolExecuteAfter,
+  createToolExecuteBefore,
+  parseFilterSpec,
+  parseSnipConfigOutput,
+  rewriteCommand,
+  runCommand,
+  sanitizeMessagesForModel,
+} from "./index"
+
+describe("parseFilterSpec", () => {
+  it("parses command, subcommand, and flag constraints", () => {
+    const filter = parseFilterSpec(`
+name: "go-test"
+version: 1
+
+match:
+  command: "go"
+  subcommand: "test"
+  exclude_flags: ["-json", "-v"]
+  require_flags:
+    - "-run"
+`)
+
+    expect(filter).toEqual({
+      name: "go-test",
+      command: "go",
+      subcommand: "test",
+      excludeFlags: ["-json", "-v"],
+      requireFlags: ["-run"],
+    })
+  })
+})
+
+describe("parseSnipConfigOutput", () => {
+  it("parses filter directories and enabled filters", () => {
+    const config = parseSnipConfigOutput([
+      "filters.dir: C:/Users/test/.config/snip/filters, Z:/repo/.snip/filters",
+      "filters.enable.go-test: true",
+      "filters.enable.git-log: false",
+    ].join("\n"))
+
+    expect(config.filterDirs).toEqual([
+      "C:/Users/test/.config/snip/filters",
+      "Z:/repo/.snip/filters",
+    ])
+    expect(config.enabledFilters.get("go-test")).toBe(true)
+    expect(config.enabledFilters.get("git-log")).toBe(false)
+  })
+})
+
+describe("runCommand", () => {
+  it("supports Node runtime without Bun shell", async () => {
+    const result = await runCommand(undefined, process.execPath, ["-e", "process.stdout.write('ok')"])
+
+    expect(result.exitCode).toBe(0)
+    expect(result.text()).toBe("ok")
+  })
+
+  it("reports non-zero exit when executable is missing", async () => {
+    const result = await runCommand(undefined, "__definitely_missing_snip_binary__", ["--version"])
+
+    expect(result.exitCode).not.toBe(0)
+  })
+})
+
+describe("SnipPlugin", () => {
+  it("initializes without Bun shell in Desktop-like runtimes", async () => {
+    const hooks = await SnipPlugin({
+      client: {} as never,
+      project: {} as never,
+      directory: "Z:/Projects/LISS",
+      worktree: "Z:/Projects/LISS",
+      experimental_workspace: { register() {} } as never,
+      serverUrl: new URL("http://localhost:4096"),
+      $: undefined as never,
+    } as never)
+
+    expect(hooks).toMatchObject({
+      "tool.execute.before": expect.any(Function),
+      "tool.execute.after": expect.any(Function),
+      "experimental.chat.messages.transform": expect.any(Function),
+    })
+  })
+})
+
+describe("rewriteCommand", () => {
+  const matcher = createSnipMatcher([
+    {
+      name: "go-test",
+      command: "go",
+      subcommand: "test",
+      excludeFlags: ["-json", "-v", "-bench", "-run"],
+    },
+    {
+      name: "go-build",
+      command: "go",
+      subcommand: "build",
+    },
+    {
+      name: "dotnet-test",
+      command: "dotnet",
+      subcommand: "test",
+    },
+    {
+      name: "git-log",
+      command: "git",
+      subcommand: "log",
+      excludeFlags: ["--format", "--pretty", "--oneline"],
+    },
+    {
+      name: "npm-install",
+      command: "npm",
+      requireFlags: ["--json"],
+    },
+    {
+      name: "ls",
+      command: "ls",
+    },
+  ])
+
+  it("rewrites matching simple commands", () => {
+    expect(rewriteCommand("go test ./...", matcher)).toBe("snip go test ./...")
+  })
+
+  it("preserves env prefixes when rewriting", () => {
+    expect(rewriteCommand("CGO_ENABLED=0 GOOS=linux go test ./...", matcher))
+      .toBe("CGO_ENABLED=0 GOOS=linux snip go test ./...")
+  })
+
+  it("only rewrites commands with an actual matching filter", () => {
+    expect(rewriteCommand("dotnet restore", matcher)).toBe("dotnet restore")
+    expect(rewriteCommand("git status", matcher)).toBe("git status")
+  })
+
+  it("respects exclude_flags", () => {
+    expect(rewriteCommand("go test -v ./...", matcher)).toBe("go test -v ./...")
+    expect(rewriteCommand("git log --oneline", matcher)).toBe("git log --oneline")
+  })
+
+  it("respects require_flags", () => {
+    expect(rewriteCommand("npm install", matcher)).toBe("npm install")
+    expect(rewriteCommand("npm install --json", matcher)).toBe("snip npm install --json")
+  })
+
+  it("rewrites chained matching commands segment by segment", () => {
+    expect(rewriteCommand("go test && go build", matcher))
+      .toBe("snip go test && snip go build")
+  })
+
+  it("does not rewrite chained non-matching commands", () => {
+    expect(rewriteCommand("cd /tmp && dotnet restore && ls", matcher))
+      .toBe("cd /tmp && dotnet restore && snip ls")
+  })
+
+  it("only rewrites the command before a pipe", () => {
+    expect(rewriteCommand("git log | head", matcher)).toBe("snip git log | head")
+  })
+
+  it("does not split pipes inside quotes", () => {
+    expect(rewriteCommand('echo "hello | world" | cat', matcher))
+      .toBe('echo "hello | world" | cat')
+  })
+
+  it("leaves explicit snip commands untouched", () => {
+    expect(rewriteCommand("snip dotnet test", matcher)).toBe("snip dotnet test")
+  })
+
+  it("handles Windows activation repro without prepending snip", () => {
+    expect(rewriteCommand('.venv\\Scripts\\activate && pip install "xinference[all]"', matcher))
+      .toBe('.venv\\Scripts\\activate && pip install "xinference[all]"')
+  })
+
+  it("preserves backslashes in Windows command paths", () => {
+    expect(rewriteCommand('.\\tools\\snip.exe dotnet test', matcher))
+      .toBe('.\\tools\\snip.exe dotnet test')
+  })
+
+  it("rewrites dotnet test to reproduce the contamination path", () => {
+    expect(rewriteCommand("dotnet test", matcher)).toBe("snip dotnet test")
+  })
+
+  it("does not break redirections around background operator parsing", () => {
+    expect(rewriteCommand('go test 2>&1 && dotnet test', matcher))
+      .toBe('snip go test 2>&1 && snip dotnet test')
+  })
+})
+
+describe("tool hooks", () => {
+  const matcher = createSnipMatcher([
+    {
+      name: "dotnet-test",
+      command: "dotnet",
+      subcommand: "test",
+    },
+  ])
+
+  let pendingRewrites: Map<string, { originalCommand: string; rewrittenCommand: string; version: 1 }>
+  let toolExecuteBefore: ReturnType<typeof createToolExecuteBefore>
+  let toolExecuteAfter: ReturnType<typeof createToolExecuteAfter>
 
   beforeEach(() => {
-    mockInput = { tool: "bash", sessionID: "s", callID: "c" }
-    mockOutput = { args: { command: "" } }
+    pendingRewrites = new Map()
+    toolExecuteBefore = createToolExecuteBefore(matcher, pendingRewrites)
+    toolExecuteAfter = createToolExecuteAfter(pendingRewrites)
   })
 
-  it("should prefix simple command with snip", async () => {
-    mockOutput.args.command = "go test ./..."
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip go test ./...")
-  })
+  it("records metadata for rewritten bash commands", async () => {
+    const output = { args: { command: "dotnet test" } }
+    await toolExecuteBefore({ tool: "bash", sessionID: "s", callID: "c" }, output)
 
-  it("should handle command with one env var prefix", async () => {
-    mockOutput.args.command = "CGO_ENABLED=0 go test ./..."
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("CGO_ENABLED=0 snip go test ./...")
-  })
-
-  it("should handle command with multiple env var prefixes", async () => {
-    mockOutput.args.command = "CGO_ENABLED=0 GOOS=linux go test ./..."
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("CGO_ENABLED=0 GOOS=linux snip go test ./...")
-  })
-
-  it("should handle command with &&", async () => {
-    mockOutput.args.command = "go test && go build"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip go test && snip go build")
-  })
-
-  it("should handle command with |", async () => {
-    mockOutput.args.command = "git log | head"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip git log | head")
-  })
-
-  it("should handle command with ;", async () => {
-    mockOutput.args.command = "go test; go build"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip go test; snip go build")
-  })
-
-  it("should handle command with ||", async () => {
-    mockOutput.args.command = "test -f foo.txt || echo missing"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip test -f foo.txt || snip echo missing")
-  })
-
-  it("should handle command with &", async () => {
-    mockOutput.args.command = "sleep 1 & sleep 2 &"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip sleep 1 & snip sleep 2 &")
-  })
-
-  it("should handle mixed operators", async () => {
-    mockOutput.args.command = "go test && go build; go run"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip go test && snip go build; snip go run")
-  })
-
-  it("should handle env vars with operators", async () => {
-    mockOutput.args.command = "FOO=bar go test && go build"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("FOO=bar snip go test && snip go build")
-  })
-
-  it("should not double prefix already prefixed command", async () => {
-    mockOutput.args.command = "snip go test"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("snip go test")
-  })
-
-  it("should not modify non-bash tool calls", async () => {
-    mockInput.tool = "read"
-    mockOutput.args.command = "go test"
-    await toolExecuteBefore(mockInput, mockOutput)
-    expect(mockOutput.args.command).toBe("go test")
-  })
-
-  describe("unproxyable shell builtins", () => {
-    it("should skip cd", async () => {
-      mockOutput.args.command = "cd /tmp"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("cd /tmp")
+    expect(output.args.command).toBe("snip dotnet test")
+    expect(pendingRewrites.get("s:c")).toEqual({
+      originalCommand: "dotnet test",
+      rewrittenCommand: "snip dotnet test",
+      version: 1,
     })
 
-    it("should skip source", async () => {
-      mockOutput.args.command = "source ~/.bashrc"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("source ~/.bashrc")
-    })
+    const afterOutput = { title: "bash", output: "ok", metadata: {} as Record<string, unknown> }
+    await toolExecuteAfter(
+      {
+        tool: "bash",
+        sessionID: "s",
+        callID: "c",
+        args: { command: "snip dotnet test" },
+      },
+      afterOutput,
+    )
 
-    it("should skip . (dot)", async () => {
-      mockOutput.args.command = ". ./env.sh"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe(". ./env.sh")
+    expect(afterOutput.metadata.opencodeSnip).toEqual({
+      originalCommand: "dotnet test",
+      rewrittenCommand: "snip dotnet test",
+      version: 1,
     })
+    expect(pendingRewrites.has("s:c")).toBe(false)
+  })
 
-    it("should skip export", async () => {
-      mockOutput.args.command = "export FOO=bar"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("export FOO=bar")
-    })
+  it("ignores non-bash tools", async () => {
+    const output = { args: { command: "dotnet test" } }
+    await toolExecuteBefore({ tool: "read", sessionID: "s", callID: "c" }, output)
+    expect(output.args.command).toBe("dotnet test")
+    expect(pendingRewrites.size).toBe(0)
+  })
 
-    it("should skip alias", async () => {
-      mockOutput.args.command = 'alias ll="ls -la"'
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe('alias ll="ls -la"')
-    })
+  it("supports shell tool id in addition to bash", async () => {
+    const output = { args: { command: "dotnet test" } }
+    await toolExecuteBefore({ tool: "shell", sessionID: "s", callID: "c" }, output)
+    expect(output.args.command).toBe("snip dotnet test")
 
-    it("should skip unset", async () => {
-      mockOutput.args.command = "unset VAR"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("unset VAR")
-    })
+    const afterOutput = { title: "shell", output: "ok", metadata: {} as Record<string, unknown> }
+    await toolExecuteAfter(
+      {
+        tool: "shell",
+        sessionID: "s",
+        callID: "c",
+        args: { command: "snip dotnet test" },
+      },
+      afterOutput,
+    )
 
-    it("should skip export with env var prefix", async () => {
-      mockOutput.args.command = "CGO_ENABLED=0 export FOO=bar"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("CGO_ENABLED=0 export FOO=bar")
-    })
-
-    it("should skip cd but snip chained command", async () => {
-      mockOutput.args.command = "cd /tmp && ls"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("cd /tmp && snip ls")
+    expect(afterOutput.metadata.opencodeSnip).toMatchObject({
+      originalCommand: "dotnet test",
+      rewrittenCommand: "snip dotnet test",
     })
   })
 
-  describe("redirections with &", () => {
-    it("should not break 2>&1 redirection", async () => {
-      mockOutput.args.command = "find / -name \"*.log\" 2>&1"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1")
-    })
+  it("does not persist metadata when command was not rewritten", async () => {
+    const output = { args: { command: "dotnet restore" } }
+    await toolExecuteBefore({ tool: "bash", sessionID: "s", callID: "c" }, output)
 
-    it("should not break 1>&2 redirection", async () => {
-      mockOutput.args.command = "cmd 1>&2"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cmd 1>&2")
-    })
+    const afterOutput = { title: "bash", output: "ok", metadata: {} as Record<string, unknown> }
+    await toolExecuteAfter(
+      {
+        tool: "bash",
+        sessionID: "s",
+        callID: "c",
+        args: { command: "dotnet restore" },
+      },
+      afterOutput,
+    )
 
-    it("should handle 2>&1 with pipe", async () => {
-      mockOutput.args.command = "find / -name \"*.log\" 2>&1 | grep error"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip find / -name \"*.log\" 2>&1 | grep error")
-    })
+    expect(afterOutput.metadata).toEqual({})
+  })
+})
 
-    it("should handle 2>&1 with chained commands", async () => {
-      mockOutput.args.command = "cmd1 2>&1 && cmd2"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cmd1 2>&1 && snip cmd2")
+describe("sanitizeMessagesForModel", () => {
+  it("restores original command for the model while keeping other data intact", () => {
+    const messages = [{
+      info: { id: "m1" },
+      parts: [{
+        id: "p1",
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "snip dotnet test", workdir: "Z:/repo" },
+          output: "tests passed",
+          title: "bash",
+          metadata: {
+            opencodeSnip: {
+              originalCommand: "dotnet test",
+              rewrittenCommand: "snip dotnet test",
+              version: 1,
+            },
+          },
+        },
+      }],
+    }]
+
+    sanitizeMessagesForModel(messages)
+
+    expect(messages[0].parts[0]).toMatchObject({
+      state: {
+        input: {
+          command: "dotnet test",
+          workdir: "Z:/repo",
+        },
+        metadata: {
+          opencodeSnip: {
+            originalCommand: "dotnet test",
+            rewrittenCommand: "snip dotnet test",
+            version: 1,
+          },
+        },
+      },
     })
   })
 
-  describe("pipe expressions with quotes", () => {
-    it("should not split pipes inside single quotes", async () => {
-      mockOutput.args.command = "cat file.json | jq '.content | .text'"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.content | .text'")
-    })
+  it("does not rewrite explicit user snip commands without plugin metadata", () => {
+    const messages = [{
+      info: { id: "m1" },
+      parts: [{
+        id: "p1",
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "snip gain" },
+          output: "report",
+          title: "bash",
+          metadata: {},
+        },
+      }],
+    }]
 
-    it("should not split pipes inside double quotes", async () => {
-      mockOutput.args.command = 'cat file.json | jq ".content | .text"'
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe('snip cat file.json | jq ".content | .text"')
+    sanitizeMessagesForModel(messages)
+    expect(messages[0].parts[0]).toMatchObject({
+      state: { input: { command: "snip gain" } },
     })
+  })
 
-    it("should handle jq with fromjson", async () => {
-      mockOutput.args.command = "cat file.json | jq '.content[0].text | fromjson'"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.content[0].text | fromjson'")
-    })
+  it("accepts plugin metadata stored at the tool part level", () => {
+    const messages = [{
+      info: { id: "m1" },
+      parts: [{
+        id: "p1",
+        type: "tool",
+        tool: "bash",
+        metadata: {
+          opencodeSnip: {
+            originalCommand: "dotnet test",
+            rewrittenCommand: "snip dotnet test",
+            version: 1,
+          },
+        },
+        state: {
+          status: "completed",
+          input: { command: "snip dotnet test" },
+          output: "tests passed",
+          title: "bash",
+        },
+      }],
+    }]
 
-    it("should handle multiple pipes in jq", async () => {
-      mockOutput.args.command = "cat file.json | jq '.a | .b | .c'"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cat file.json | jq '.a | .b | .c'")
-    })
-
-    it("should handle pipe with || operator", async () => {
-      mockOutput.args.command = "cmd1 || cmd2"
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe("snip cmd1 || snip cmd2")
-    })
-
-    it("should handle mixed quotes and pipes", async () => {
-      mockOutput.args.command = 'echo "hello | world" | cat'
-      await toolExecuteBefore(mockInput, mockOutput)
-      expect(mockOutput.args.command).toBe('snip echo "hello | world" | cat')
+    sanitizeMessagesForModel(messages)
+    expect(messages[0].parts[0]).toMatchObject({
+      state: { input: { command: "dotnet test" } },
     })
   })
 })
